@@ -1,39 +1,43 @@
-import { Signer, StateUpdateListener } from '../interface';
+import { StateUpdateListener } from '../interface';
 import { SCWKeyManager } from './SCWKeyManager';
 import { SCWStateManager } from './SCWStateManager';
-import { PopUpCommunicator } from ':core/communicator/PopUpCommunicator';
+import { Communicator } from ':core/communicator/Communicator';
 import { standardErrors } from ':core/error';
-import { createMessage } from ':core/message';
-import { Action, SupportedEthereumMethods, SwitchEthereumChainAction } from ':core/message/Action';
+import { RPCRequestMessage, RPCResponse, RPCResponseMessage } from ':core/message';
+import { AppMetadata, RequestArguments, Signer } from ':core/provider/interface';
+import { Method } from ':core/provider/method';
+import { AddressString } from ':core/type';
+import { ensureIntNumber } from ':core/type/util';
 import {
   decryptContent,
   encryptContent,
   exportKeyToHexString,
   importKeyFromHexString,
-} from ':core/message/Cipher';
-import { RPCRequestMessage, RPCResponseMessage } from ':core/message/RPCMessage';
-import { RPCResponse } from ':core/message/RPCResponse';
-import { AppMetadata, RequestArguments } from ':core/provider/interface';
-import { AddressString } from ':core/type';
-import { ensureIntNumber } from ':core/util';
+} from ':util/cipher';
+
+type SwitchEthereumChainParam = [
+  {
+    chainId: `0x${string}`; // Hex chain id
+  },
+];
 
 export class SCWSigner implements Signer {
-  private metadata: AppMetadata;
-  private popupCommunicator: PopUpCommunicator;
-  private keyManager: SCWKeyManager;
-  private stateManager: SCWStateManager;
+  private readonly metadata: AppMetadata;
+  private readonly communicator: Communicator;
+  private readonly keyManager: SCWKeyManager;
+  private readonly stateManager: SCWStateManager;
 
-  constructor(options: {
+  constructor(params: {
     metadata: AppMetadata;
-    popupCommunicator: PopUpCommunicator;
+    communicator: Communicator;
     updateListener: StateUpdateListener;
   }) {
-    this.metadata = options.metadata;
-    this.popupCommunicator = options.popupCommunicator;
+    this.metadata = params.metadata;
+    this.communicator = params.communicator;
     this.keyManager = new SCWKeyManager();
     this.stateManager = new SCWStateManager({
       appChainIds: this.metadata.appChainIds,
-      updateListener: options.updateListener,
+      updateListener: params.updateListener,
     });
 
     this.handshake = this.handshake.bind(this);
@@ -42,18 +46,16 @@ export class SCWSigner implements Signer {
     this.decryptResponseMessage = this.decryptResponseMessage.bind(this);
   }
 
-  public async handshake(): Promise<AddressString[]> {
-    await this.popupCommunicator.connect();
-
+  async handshake(): Promise<AddressString[]> {
     const handshakeMessage = await this.createRequestMessage({
       handshake: {
-        method: SupportedEthereumMethods.EthRequestAccounts,
+        method: 'eth_requestAccounts',
         params: this.metadata,
       },
     });
-    const response = (await this.popupCommunicator.postMessageForResponse(
+    const response: RPCResponseMessage = await this.communicator.postRequestAndWaitForResponse(
       handshakeMessage
-    )) as RPCResponseMessage;
+    );
 
     // store peer's public key
     if ('failure' in response.content) throw response.content.failure;
@@ -61,7 +63,7 @@ export class SCWSigner implements Signer {
     await this.keyManager.setPeerPublicKey(peerPublicKey);
 
     const decrypted = await this.decryptResponseMessage<AddressString[]>(response);
-    this.updateInternalState({ method: SupportedEthereumMethods.EthRequestAccounts }, decrypted);
+    this.updateInternalState({ method: 'eth_requestAccounts' }, decrypted);
 
     const result = decrypted.result;
     if ('error' in result) throw result.error;
@@ -69,14 +71,17 @@ export class SCWSigner implements Signer {
     return this.stateManager.accounts;
   }
 
-  public async request<T>(request: RequestArguments): Promise<T> {
+  async request<T>(request: RequestArguments): Promise<T> {
     const localResult = this.tryLocalHandling<T>(request);
     if (localResult !== undefined) {
       if (localResult instanceof Error) throw localResult;
       return localResult;
     }
 
-    await this.popupCommunicator.connect();
+    // Open the popup before constructing the request message.
+    // This is to ensure that the popup is not blocked by some browsers (i.e. Safari)
+    await this.communicator.waitForPopupLoaded();
+
     const response = await this.sendEncryptedRequest(request);
     const decrypted = await this.decryptResponseMessage<T>(response);
     this.updateInternalState(request, decrypted);
@@ -93,9 +98,9 @@ export class SCWSigner implements Signer {
   }
 
   private tryLocalHandling<T>(request: RequestArguments): T | undefined {
-    switch (request.method) {
-      case SupportedEthereumMethods.WalletSwitchEthereumChain: {
-        const params = request.params as SwitchEthereumChainAction['params'];
+    switch (request.method as Method) {
+      case 'wallet_switchEthereumChain': {
+        const params = request.params as SwitchEthereumChainParam;
         if (!params || !params[0]?.chainId) {
           throw standardErrors.rpc.invalidParams();
         }
@@ -105,7 +110,7 @@ export class SCWSigner implements Signer {
         // https://eips.ethereum.org/EIPS/eip-3326#wallet_switchethereumchain
         return switched ? (null as T) : undefined;
       }
-      case SupportedEthereumMethods.WalletGetCapabilities: {
+      case 'wallet_getCapabilities': {
         const walletCapabilities = this.stateManager.walletCapabilities;
         if (!walletCapabilities) {
           // This should never be the case for scw connections as capabilities are set during handshake
@@ -130,28 +135,26 @@ export class SCWSigner implements Signer {
 
     const encrypted = await encryptContent(
       {
-        action: request as Action,
+        action: request,
         chainId: this.stateManager.activeChain.id,
       },
       sharedSecret
     );
     const message = await this.createRequestMessage({ encrypted });
 
-    const response = (await this.popupCommunicator.postMessageForResponse(
-      message
-    )) as RPCResponseMessage;
-    return response;
+    return this.communicator.postRequestAndWaitForResponse(message);
   }
 
   private async createRequestMessage(
     content: RPCRequestMessage['content']
   ): Promise<RPCRequestMessage> {
     const publicKey = await exportKeyToHexString('public', await this.keyManager.getOwnPublicKey());
-    return createMessage<RPCRequestMessage>({
+    return {
+      id: crypto.randomUUID(),
       sender: publicKey,
       content,
       timestamp: new Date(),
-    });
+    };
   }
 
   private async decryptResponseMessage<T>(message: RPCResponseMessage): Promise<RPCResponse<T>> {
@@ -184,18 +187,18 @@ export class SCWSigner implements Signer {
     const result = response.result;
     if ('error' in result) return;
 
-    switch (request.method) {
-      case SupportedEthereumMethods.EthRequestAccounts: {
+    switch (request.method as Method) {
+      case 'eth_requestAccounts': {
         const accounts = result.value as AddressString[];
         this.stateManager.updateAccounts(accounts);
         break;
       }
-      case SupportedEthereumMethods.WalletSwitchEthereumChain: {
+      case 'wallet_switchEthereumChain': {
         // "return null if the request was successful"
         // https://eips.ethereum.org/EIPS/eip-3326#wallet_switchethereumchain
         if (result.value !== null) return;
 
-        const params = request.params as SwitchEthereumChainAction['params'];
+        const params = request.params as SwitchEthereumChainParam;
         const chainId = ensureIntNumber(params[0].chainId);
         this.stateManager.switchChain(chainId);
         break;

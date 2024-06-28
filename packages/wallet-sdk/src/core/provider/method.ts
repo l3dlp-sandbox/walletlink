@@ -1,7 +1,6 @@
 const mapping = {
-  fetch: [],
+  handshake: ['eth_requestAccounts'],
   sign: [
-    'eth_requestAccounts',
     'eth_ecRecover',
     'personal_sign',
     'personal_ecRecover',
@@ -16,22 +15,22 @@ const mapping = {
     'wallet_watchAsset',
     'wallet_getCapabilities',
     'wallet_sendCalls',
+    'wallet_showCallsStatus',
   ],
-  state: ['eth_chainId', 'eth_accounts', 'eth_coinbase', 'net_version'],
-  filter: [
-    'eth_newFilter',
-    'eth_newBlockFilter',
-    'eth_newPendingTransactionFilter',
-    'eth_getFilterChanges',
-    'eth_getFilterLogs',
-    'eth_uninstallFilter',
+  state: [
+    // internal state
+    'eth_chainId',
+    'eth_accounts',
+    'eth_coinbase',
+    'net_version',
   ],
   deprecated: ['eth_sign', 'eth_signTypedData_v2'],
   unsupported: ['eth_subscribe', 'eth_unsubscribe'],
+  fetch: [],
 } as const;
 
 export type MethodCategory = keyof typeof mapping;
-export type Method<C extends MethodCategory> = (typeof mapping)[C][number];
+export type Method<C extends MethodCategory = MethodCategory> = (typeof mapping)[C][number];
 
 export function determineMethodCategory(method: string): MethodCategory | undefined {
   for (const c in mapping) {
